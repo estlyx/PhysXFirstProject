@@ -1,293 +1,540 @@
 ﻿#include <iostream>
+#include <array>
+#include <cctype>
+#include <cstdio>
+
 #include <PxPhysicsAPI.h>
 
 #include "snippetrender/SnippetRender.h"
 #include "snippetrender/SnippetCamera.h"
 
-Snippets::Camera *camera;
-physx::PxDefaultAllocator allocator;
-physx::PxDefaultErrorCallback errorCallback;
-physx::PxFoundation* foundation;
-//physx::PxPvd* pvd;
-physx::PxPvdTransport* transport;
-physx::PxPhysics* physics;
-physx::PxScene* scene;
-physx::PxArray<physx::PxActor*> removedActors;
-physx::PxMaterial* rockMaterial;
+using namespace physx;
 
-class CustomEventCallback : public physx::PxSimulationEventCallback {
-    virtual void onConstraintBreak(physx::PxConstraintInfo* constraints, physx::PxU32 count) override {};
-    virtual void onWake(physx::PxActor** actors, physx::PxU32 count) override {};
-    virtual void onSleep(physx::PxActor** actors, physx::PxU32 count) override {};
-    virtual void onContact(const physx::PxContactPairHeader& pairHeader, const physx::PxContactPair* pairs, physx::PxU32 nbPairs) override {
-        for (int i = 0; i < nbPairs; i++) {
-            const physx::PxContactPair& pair = pairs[i];
-            physx::PxContactPairPoint contacts[8];
-            uint32_t contactsNum = pair.extractContacts(contacts, 8);
-            for (int j = 0; j < contactsNum; j++) {
-                physx::PxContactPairPoint &contact = contacts[j];
-                std::cout << "Projectile hit at position " << contact.position[0] << ", " << contact.position[1] << ", " << contact.position[2] << "\n";
-            }
+// -------------------- Globals (как в твоём примере) --------------------
+Snippets::Camera* camera = nullptr;
+
+PxDefaultAllocator allocator;
+PxDefaultErrorCallback errorCallback;
+
+PxFoundation* foundation = nullptr;
+PxPvd* pvd = nullptr;
+PxPvdTransport* transport = nullptr;
+
+PxPhysics* physics = nullptr;
+PxScene* scene = nullptr;
+PxDefaultCpuDispatcher* dispatcher = nullptr;
+
+PxMaterial* tableMaterial = nullptr;
+PxMaterial* railMaterial = nullptr;
+PxMaterial* ballMaterial = nullptr;
+
+// Очередь на удаление актёров (после fetchResults)
+PxArray<PxActor*> removedActors;
+
+// -------------------- Размеры (в "твоих" единицах) --------------------
+constexpr float kBallR = 0.25f;
+
+constexpr float kTableHalfX = 8.0f;
+constexpr float kTableHalfZ = 14.0f;
+
+constexpr float kRailThick = 0.8f;
+constexpr float kRailH = 1.0f;
+
+// ---- Лунки (trigger) ----
+// Лунки “в бортах”: центр на линии борта (по центру толщины борта),
+// а радиус такой, чтобы область триггера заходила внутрь поля.
+constexpr float kPocketRadius = (kBallR * 1.6f + kRailThick * 0.6f);
+
+// координаты центров лунок по X/Z на линии бортов
+constexpr float kPocketX = (kTableHalfX + kRailThick * 0.5f);
+constexpr float kPocketZ = (kTableHalfZ + kRailThick * 0.5f);
+
+// -------------------- Balls --------------------
+struct Ball
+{
+    PxRigidDynamic* actor = nullptr;
+    bool isCue = false;
+    bool pocketed = false;
+    int id = -1;
+};
+
+std::array<Ball, 16> balls;
+Ball* cueBall = nullptr;
+
+// -------------------- Game state --------------------
+bool gameOver = false;
+bool printedGameOver = false;
+bool winGame = false;
+
+// -------------------- Aim/shot --------------------
+float aimAngle = 0.0f;        // 0 => +Z (к пирамиде)
+float shotImpulse = 30.0f;
+float aimLineLen = 6.0f;
+
+// -------------------- Camera сверху (фиксируем каждый кадр) --------------------
+float camHeight = 45.0f;
+float camBackZ = 0.01f;
+PxVec3 camTarget(0.0f, 0.0f, 0.0f);
+
+// -------------------- Filter shader: триггеры + контакты --------------------
+PxFilterFlags CustomSimulationFilterShader(
+    PxFilterObjectAttributes attributes0, PxFilterData,
+    PxFilterObjectAttributes attributes1, PxFilterData,
+    PxPairFlags& pairFlags,
+    const void*, PxU32)
+{
+    if (PxFilterObjectIsTrigger(attributes0) || PxFilterObjectIsTrigger(attributes1))
+    {
+        pairFlags = PxPairFlag::eTRIGGER_DEFAULT;
+        return PxFilterFlag::eDEFAULT;
+    }
+
+    pairFlags = PxPairFlag::eCONTACT_DEFAULT;
+    return PxFilterFlag::eDEFAULT;
+}
+
+// -------------------- Trigger callback (как у тебя) --------------------
+class CustomEventCallback : public PxSimulationEventCallback
+{
+public:
+    void onTrigger(PxTriggerPair* pairs, PxU32 count) override
+    {
+        for (PxU32 i = 0; i < count; i++)
+        {
+            const PxTriggerPair& pair = pairs[i];
+
+            if (!(pair.status & PxPairFlag::eNOTIFY_TOUCH_FOUND))
+                continue;
+
+            PxActor* other = pair.otherActor; // шар
+            if (!other) continue;
+
+            Ball* b = reinterpret_cast<Ball*>(other->userData);
+            if (!b) continue;
+
+            // не добавляем повторно
+            if (b->pocketed) continue;
+
+            b->pocketed = true;
+            removedActors.pushBack(other);
+
+            // можно отладить:
+            // std::cout << "POCKET ball id=" << b->id << (b->isCue ? " (CUE)\n" : "\n");
         }
-    };
-    virtual void onTrigger(physx::PxTriggerPair* pairs, physx::PxU32 count) override {
-        for (physx::PxU32 i = 0; i < count; i++) {
-            const physx::PxTriggerPair& pair = pairs[i];
-            switch (pair.status) {
-            case physx::PxPairFlag::eNOTIFY_TOUCH_FOUND:
-                /*std::cout << "TRIGGER FOUND\n";*/
-                removedActors.pushBack(pair.otherActor);
-                break;
-            /*case physx::PxPairFlag::eNOTIFY_TOUCH_PERSISTS:
-                std::cout << "TRIGGER PERSISTS\n";
-                break;*/
-            case physx::PxPairFlag::eNOTIFY_TOUCH_LOST:
-                std::cout << "TRIGGER LOST\n";
-                break;
-            default:
-                break;
-            }
-        }
-    };
-    virtual void onAdvance(const physx::PxRigidBody* const* bodyBuffer, const physx::PxTransform* poseBuffer, const physx::PxU32 count) override {};
+    }
+
+    void onConstraintBreak(PxConstraintInfo*, PxU32) override {}
+    void onWake(PxActor**, PxU32) override {}
+    void onSleep(PxActor**, PxU32) override {}
+    void onContact(const PxContactPairHeader&, const PxContactPair*, PxU32) override {}
+    void onAdvance(const PxRigidBody* const*, const PxTransform*, const PxU32) override {}
 };
 
 CustomEventCallback customEventCallback;
 
-enum Body {
-    BOX = 1,
-    OBSTACLE,
-    TRIGGER
-};
+// -------------------- Create helpers (как у тебя: createShape + attachShape) --------------------
+static PxRigidStatic* createStaticPlane()
+{
+    PxPlane plane(PxVec3(0, 1, 0), 0.0f);
+    PxRigidStatic* groundActor = PxCreatePlane(*physics, plane, *tableMaterial);
+    scene->addActor(*groundActor);
+    return groundActor;
+}
 
-struct CustomFilterShaderConstantBlock {
-    bool needCollision = true;
-};
-CustomFilterShaderConstantBlock constantBlock;
+static PxRigidStatic* createStaticBox(const PxVec3& pos, const PxVec3& halfExt, PxMaterial& mat)
+{
+    PxBoxGeometry geom(halfExt);
+    PxShape* shape = physics->createShape(geom, mat, true);
 
-physx::PxFilterFlags CustomSimulationFilterShader (
-    physx::PxFilterObjectAttributes attributes0,
-    physx::PxFilterData filterData0,
-    physx::PxFilterObjectAttributes attributes1,
-    physx::PxFilterData filterData1,
-    physx::PxPairFlags& pairFlags,
-    const void* constantBlock,
-    physx::PxU32 constantBlockSize
-) {
-    if (physx::PxFilterObjectIsTrigger(attributes0) || physx::PxFilterObjectIsTrigger(attributes1)) {
-        pairFlags = physx::PxPairFlag::eTRIGGER_DEFAULT;
-        return physx::PxFilterFlag::eDEFAULT;
+    PxRigidStatic* actor = physics->createRigidStatic(PxTransform(pos));
+    actor->attachShape(*shape);
+
+    scene->addActor(*actor);
+    return actor;
+}
+
+static PxRigidDynamic* createDynamicSphere(const PxVec3& pos, float radius, PxMaterial& mat, float density)
+{
+    PxSphereGeometry geom(radius);
+    PxShape* shape = physics->createShape(geom, mat, true);
+
+    PxRigidDynamic* actor = physics->createRigidDynamic(PxTransform(pos));
+    actor->attachShape(*shape);
+
+    PxRigidBodyExt::updateMassAndInertia(*actor, density);
+
+    actor->setLinearDamping(0.12f);
+    actor->setAngularDamping(0.35f);
+    actor->setSleepThreshold(0.02f);
+
+    scene->addActor(*actor);
+    return actor;
+}
+
+static PxRigidStatic* createPocketTriggerSphere(const PxVec3& pos)
+{
+    PxSphereGeometry geom(kPocketRadius);
+    PxShape* shape = physics->createShape(geom, *railMaterial, true);
+
+    // trigger shape
+    shape->setFlag(PxShapeFlag::eSIMULATION_SHAPE, false);
+    shape->setFlag(PxShapeFlag::eTRIGGER_SHAPE, true);
+
+    // чтобы не было “странных шаров/текстур” — триггеры не рисуем
+    shape->setFlag(PxShapeFlag::eVISUALIZATION, false);
+
+    PxRigidStatic* actor = physics->createRigidStatic(PxTransform(pos));
+    actor->attachShape(*shape);
+    scene->addActor(*actor);
+    return actor;
+}
+
+// -------------------- Table + rails --------------------
+static void createTableAndRails()
+{
+    createStaticPlane();
+
+    // Левый/правый борта вдоль Z
+    createStaticBox(
+        PxVec3(+(kTableHalfX + kRailThick * 0.5f), kRailH * 0.5f, 0.0f),
+        PxVec3(kRailThick * 0.5f, kRailH * 0.5f, kTableHalfZ + kRailThick),
+        *railMaterial
+    );
+    createStaticBox(
+        PxVec3(-(kTableHalfX + kRailThick * 0.5f), kRailH * 0.5f, 0.0f),
+        PxVec3(kRailThick * 0.5f, kRailH * 0.5f, kTableHalfZ + kRailThick),
+        *railMaterial
+    );
+
+    // Верх/низ вдоль X
+    createStaticBox(
+        PxVec3(0.0f, kRailH * 0.5f, +(kTableHalfZ + kRailThick * 0.5f)),
+        PxVec3(kTableHalfX + kRailThick, kRailH * 0.5f, kRailThick * 0.5f),
+        *railMaterial
+    );
+    createStaticBox(
+        PxVec3(0.0f, kRailH * 0.5f, -(kTableHalfZ + kRailThick * 0.5f)),
+        PxVec3(kTableHalfX + kRailThick, kRailH * 0.5f, kRailThick * 0.5f),
+        *railMaterial
+    );
+}
+
+static void createPockets()
+{
+    const float y = kBallR;
+
+    // 4 угла — в районе углов бортов
+    createPocketTriggerSphere(PxVec3(+kPocketX, y, +kPocketZ));
+    createPocketTriggerSphere(PxVec3(-kPocketX, y, +kPocketZ));
+    createPocketTriggerSphere(PxVec3(+kPocketX, y, -kPocketZ));
+    createPocketTriggerSphere(PxVec3(-kPocketX, y, -kPocketZ));
+
+    // центры длинных бортов (длинные вдоль Z, значит центры на x=±)
+    createPocketTriggerSphere(PxVec3(+kPocketX + 0.25, y, 0.0f));
+    createPocketTriggerSphere(PxVec3(-kPocketX - 0.25, y, 0.0f));
+}
+
+// -------------------- Rack balls --------------------
+static void clearBalls()
+{
+    for (auto& b : balls)
+    {
+        if (b.actor)
+        {
+            scene->removeActor(*b.actor);
+            b.actor->release();
+            b.actor = nullptr;
+        }
+        b.isCue = false;
+        b.pocketed = false;
+        b.id = -1;
     }
+    cueBall = nullptr;
+}
 
-    // при выключении флага выключаем взаимодействие между создаваемыми коробками (будут проходить сквозь друг друга)
-    if (constantBlockSize == sizeof(CustomFilterShaderConstantBlock)) {
-        const CustomFilterShaderConstantBlock* block = (CustomFilterShaderConstantBlock*)constantBlock;
-        if (!block->needCollision) {
-            if (filterData0.word0 == Body::BOX && filterData1.word0 == Body::BOX) {
-                pairFlags = physx::PxPairFlag::eCONTACT_DEFAULT;
-                return physx::PxFilterFlag::eKILL;
-            }
+static void rackBalls()
+{
+    removedActors.clear();
+    clearBalls();
+
+    gameOver = false;
+    winGame = false;
+    printedGameOver = false;
+
+    const float gap = 0.02f;
+    const float dx = (2.0f * kBallR + gap);
+    const float dz = (PxSqrt(3.0f) * kBallR + gap);
+
+    const float rackZ = +0.55f * kTableHalfZ;
+    const float cueZ = -0.55f * kTableHalfZ;
+
+    int k = 0;
+    for (int row = 0; row < 5; ++row)
+    {
+        for (int j = 0; j <= row; ++j)
+        {
+            const float x = (j - row * 0.5f) * dx;
+            const float z = rackZ + row * dz;
+
+            balls[k].id = k;
+            balls[k].isCue = false;
+            balls[k].pocketed = false;
+            balls[k].actor = createDynamicSphere(PxVec3(x, kBallR, z), kBallR, *ballMaterial, 10.0f);
+            balls[k].actor->userData = &balls[k];
+            ++k;
         }
     }
 
-    if ((filterData0.word0 == Body::BOX && filterData1.word0 == Body::OBSTACLE) || (filterData0.word0 == Body::OBSTACLE && filterData1.word0 == Body::BOX)) {
-        pairFlags = physx::PxPairFlag::eCONTACT_DEFAULT | physx::PxPairFlag::eNOTIFY_TOUCH_FOUND | physx::PxPairFlag::eNOTIFY_CONTACT_POINTS;
-        return physx::PxFilterFlag::eDEFAULT;
-    }
+    // cue ball (id=15)
+    balls[15].id = 15;
+    balls[15].isCue = true;
+    balls[15].pocketed = false;
+    balls[15].actor = createDynamicSphere(PxVec3(0.0f, kBallR, cueZ), kBallR, *ballMaterial, 10.0f);
+    balls[15].actor->userData = &balls[15];
+    cueBall = &balls[15];
 
-    pairFlags = physx::PxPairFlag::eCONTACT_DEFAULT;
-    return physx::PxFilterFlag::eDEFAULT;
+    aimAngle = 0.0f;
+    shotImpulse = 30.0f;
+
+    std::cout << "Controls: J/L aim, I/K power, Space shoot, R restart\n";
 }
 
-void initPhysics() {
+// -------------------- Aim direction --------------------
+static PxVec3 aimDir()
+{
+    const float sx = PxSin(aimAngle);
+    const float cz = PxCos(aimAngle);
+    PxVec3 d(sx, 0.0f, cz);
+    if (d.normalize() < 1e-6f) return PxVec3(0, 0, 1);
+    return d;
+}
+
+// -------------------- shoot --------------------
+static void shoot()
+{
+    if (gameOver) return;
+    if (!cueBall || !cueBall->actor) return;
+
+    PxVec3 d = aimDir();
+    cueBall->actor->wakeUp();
+    cueBall->actor->addForce(d * shotImpulse, PxForceMode::eIMPULSE);
+}
+
+static bool allObjectBallsPocketed()
+{
+    for (const auto& b : balls)
+    {
+        if (b.isCue) continue;
+        if (!b.pocketed) return false;
+    }
+    return true;
+}
+
+// -------------------- process removals --------------------
+static void processRemovals()
+{
+    if (!removedActors.size())
+        return;
+
+    for (PxU32 i = 0; i < removedActors.size(); i++)
+    {
+        PxActor* a = removedActors[i];
+        Ball* b = reinterpret_cast<Ball*>(a->userData);
+        if (!b) continue;
+        if (!b->actor) continue;
+
+        if (b->isCue)
+        {
+            gameOver = true;
+        }
+
+        scene->removeActor(*b->actor);
+        b->actor->release();
+        b->actor = nullptr;
+    }
+
+    removedActors.clear();
+
+    if (!gameOver && allObjectBallsPocketed())
+    {
+        gameOver = true;
+        winGame = true;
+        std::cout << "WIN: all object balls pocketed! Press R to restart.\n";
+    }
+
+    if (gameOver && !printedGameOver)
+    {
+        printedGameOver = true;
+        if (winGame)
+            std::cout << "WIN: all object balls pocketed! Press R to restart.\n";
+        else
+            std::cout << "LOSE: cue ball pocketed. Press R to restart.\n";
+    }
+}
+
+// -------------------- initPhysics --------------------
+void initPhysics()
+{
     foundation = PxCreateFoundation(PX_PHYSICS_VERSION, allocator, errorCallback);
 
-    physx::PxPvd* pvd = physx::PxCreatePvd(*foundation);
-    transport = physx::PxDefaultPvdSocketTransportCreate("127.0.0.1", 5425, 10000);
-    if (pvd && transport) {
-        bool success = pvd->connect(*transport, physx::PxPvdInstrumentationFlag::eALL);
-        if (!success) {
-            std::cerr << "PVD was not created\n";
-        }
+    pvd = PxCreatePvd(*foundation);
+    transport = PxDefaultPvdSocketTransportCreate("127.0.0.1", 5425, 10000);
+    if (pvd && transport)
+    {
+        bool success = pvd->connect(*transport, PxPvdInstrumentationFlag::eALL);
+        if (!success)
+            std::cerr << "PVD was not created/connected\n";
     }
-    physics = PxCreatePhysics(PX_PHYSICS_VERSION, *foundation, physx::PxTolerancesScale(), true, pvd);
 
-    physx::PxSceneDesc sceneDesc = physx::PxSceneDesc(physics->getTolerancesScale());
-    sceneDesc.gravity = physx::PxVec3(0.0f, -9.81f, 0.0f);
-    sceneDesc.cpuDispatcher = physx::PxDefaultCpuDispatcherCreate(2);
+    physics = PxCreatePhysics(PX_PHYSICS_VERSION, *foundation, PxTolerancesScale(), true, pvd);
+
+    PxSceneDesc sceneDesc(physics->getTolerancesScale());
+    sceneDesc.gravity = PxVec3(0.0f, -9.81f, 0.0f);
+    dispatcher = PxDefaultCpuDispatcherCreate(2);
+    sceneDesc.cpuDispatcher = dispatcher;
+
     sceneDesc.filterShader = CustomSimulationFilterShader;
-    sceneDesc.filterShaderData = &constantBlock;
-    sceneDesc.filterShaderDataSize = sizeof(constantBlock);
     sceneDesc.simulationEventCallback = &customEventCallback;
+
     scene = physics->createScene(sceneDesc);
 
-    if (pvd && pvd->isConnected()) {
-        physx::PxPvdSceneClient* pvdClient = scene->getScenePvdClient();
-        if (pvdClient) {
-            pvdClient->setScenePvdFlag(physx::PxPvdSceneFlag::eTRANSMIT_CONSTRAINTS, true);
-            pvdClient->setScenePvdFlag(physx::PxPvdSceneFlag::eTRANSMIT_CONTACTS, true);
-            pvdClient->setScenePvdFlag(physx::PxPvdSceneFlag::eTRANSMIT_SCENEQUERIES, true);
-        }
-    }
+    // материалы
+    tableMaterial = physics->createMaterial(0.5f, 0.5f, 0.05f);
+    railMaterial = physics->createMaterial(0.6f, 0.6f, 0.2f);
+    ballMaterial = physics->createMaterial(0.15f, 0.15f, 0.05f);
 
-    rockMaterial = physics->createMaterial(0.5f, 0.5f, 0.1f);
-    physx::PxMaterial* metalMaterial = physics->createMaterial(0.15f, 0.15f, 0.1f);
-    physx::PxMaterial* iceMaterial = physics->createMaterial(0.028f, 0.028f, 0.1f);
-
-    // для теста триггеров
-    //const physx::PxVec3 planeNormal = physx::PxVec3(0.3f, 1.0f, 0.0f).getNormalized();
-    const physx::PxVec3 planeNormal = physx::PxVec3(0.0f, 1.0f, 0.0f);
-    physx::PxPlane plane = physx::PxPlane(planeNormal, 0.0f);
-    physx::PxRigidStatic* groundActor = physx::PxCreatePlane(*physics, plane, *rockMaterial);
-    scene->addActor(*groundActor);
-
-    physx::PxBoxGeometry boxGeometry = physx::PxBoxGeometry(physx::PxVec3(0.5f, 0.5f, 0.5f));
-
-    physx::PxShape* rockBoxShape = physics->createShape(boxGeometry, *rockMaterial, true);
-    physx::PxRigidDynamic* rockBoxActor = physics->createRigidDynamic(physx::PxTransform(physx::PxVec3(0.0f, 2.0f, -2.0f)));
-    rockBoxActor->attachShape(*rockBoxShape);
-    physx::PxRigidBodyExt::updateMassAndInertia(*rockBoxActor, 10.0f);
-    scene->addActor(*rockBoxActor);
-
-    physx::PxShape* metalBoxShape = physics->createShape(boxGeometry, *metalMaterial, true);
-    physx::PxRigidDynamic* metalBoxActor = physics->createRigidDynamic(physx::PxTransform(physx::PxVec3(0.0f, 2.0f, 0.0f)));
-    metalBoxActor->attachShape(*metalBoxShape);
-    physx::PxRigidBodyExt::updateMassAndInertia(*metalBoxActor, 10.0f);
-    scene->addActor(*metalBoxActor);
-
-    physx::PxShape* iceBoxShape = physics->createShape(boxGeometry, *iceMaterial, true);
-    physx::PxRigidDynamic* iceBoxActor = physics->createRigidDynamic(physx::PxTransform(physx::PxVec3(0.0f, 2.0f, 2.0f)));
-    iceBoxActor->attachShape(*iceBoxShape);
-    physx::PxRigidBodyExt::updateMassAndInertia(*iceBoxActor, 10.0f);
-    scene->addActor(*iceBoxActor);
-
-    //для теста триггеров
-    //physx::PxBoxGeometry obstacleGeometry = physx::PxBoxGeometry(physx::PxVec3(0.5, 0.5, 20.0));
-    physx::PxBoxGeometry obstacleGeometry = physx::PxBoxGeometry(physx::PxVec3(2.5, 2.5, 2.5));
-    physx::PxShape* obstacleShape = physics->createShape(obstacleGeometry, *rockMaterial, true);
-    physx::PxFilterData obstacleFilterData(Body::OBSTACLE, 0, 0, 0);
-    obstacleShape->setSimulationFilterData(obstacleFilterData);
-    physx::PxRigidStatic* obstacleActor = physics->createRigidStatic(
-        physx::PxTransform(physx::PxVec3(0.0, 2.5, 0.0), physx::PxQuat(1.0))
-        // для теста триггеров
-        //physx::PxTransform(physx::PxVec3(-0.2, 0.0, 0.0), physx::PxQuat(physx::PxPiDivFour, physx::PxVec3(0.0, 0.0, 1.0)))
-    );
-    obstacleActor->attachShape(*obstacleShape);
-    scene->addActor(*obstacleActor);
-    
-    // триггер, не участвует в физической симуляции
-    // для теста триггеров
-    //physx::PxBoxGeometry triggerGeometry = physx::PxBoxGeometry(physx::PxVec3(0.5, 20.0, 20.0));
-    //physx::PxShape* triggerShape = physics -> createShape(triggerGeometry, *rockMaterial, true, physx::PxShapeFlag::eTRIGGER_SHAPE);
-    //physx::PxFilterData triggerFilterData(Body::TRIGGER, 0, 0, 0);
-    //triggerShape->setSimulationFilterData(triggerFilterData);
-    //physx::PxRigidStatic* triggerActor = physics->createRigidStatic(physx::PxTransform(physx::PxVec3(5.0, 0.0, 0.0)));
-    //triggerActor->attachShape(*triggerShape);
-    //scene->addActor(*triggerActor);
+    createTableAndRails();
+    createPockets();
+    rackBalls();
 }
 
-void keyPress(unsigned char key, const physx::PxTransform& cameraTransform)
+// -------------------- input --------------------
+void keyPress(unsigned char key, const PxTransform&)
 {
-    switch (toupper(key)) {
+    switch (std::toupper(key))
+    {
     case ' ':
-        {
-            physx::PxSphereGeometry sphereGeometry = physx::PxSphereGeometry(0.25f);
-            physx::PxShape* sphereShape = physics->createShape(sphereGeometry, *rockMaterial, true);
-            physx::PxFilterData sphereFilterData(Body::BOX, 0, 0, 0);
-            sphereShape->setSimulationFilterData(sphereFilterData);
-            physx::PxRigidDynamic* sphereActor = physics->createRigidDynamic(physx::PxTransform(cameraTransform.p));
-            sphereActor->attachShape(*sphereShape);
-            physx::PxRigidBodyExt::updateMassAndInertia(*sphereActor, 10.0f);
-            scene->addActor(*sphereActor);
-            sphereActor->addForce(camera->getDir() * 10.0f, physx::PxForceMode::eIMPULSE);
-            //для теста триггеров
-            //physx::PxBoxGeometry boxGeometry = physx::PxBoxGeometry(physx::PxVec3(0.5f, 0.5f, 0.5f));
-            //physx::PxShape* boxShape = physics->createShape(boxGeometry, *rockMaterial, true);
-            //physx::PxFilterData boxFilterData(Body::BOX, 0, 0, 0);
-            //boxShape->setSimulationFilterData(boxFilterData);
-            //physx::PxRigidDynamic* boxActor = physics->createRigidDynamic(physx::PxTransform(physx::PxVec3(0.0f, 2.0f, 0.0f)));
-            //boxActor->attachShape(*boxShape);
-            //physx::PxRigidBodyExt::updateMassAndInertia(*boxActor, 10.0f);
-            //scene->addActor(*boxActor);
-        }
+        shoot();
         break;
-    case 'G':
-        {
-            constantBlock.needCollision = !constantBlock.needCollision;
-            scene->setFilterShaderData(&constantBlock, sizeof(constantBlock));
-        }
+
+    case 'L':
+        aimAngle -= 0.08f;
         break;
+    case 'J':
+        aimAngle += 0.08f;
+        break;
+
+    case 'I':
+        shotImpulse += 2.0f;
+        if (shotImpulse > 120.0f) shotImpulse = 120.0f;
+        break;
+    case 'K':
+        shotImpulse -= 2.0f;
+        if (shotImpulse < 1.0f) shotImpulse = 1.0f;
+        break;
+
+    case 'U': // zoom out
+        camHeight += 2.0f;
+        camBackZ += 1.0f;
+        break;
+    case 'O': // zoom in
+        camHeight -= 2.0f;
+        camBackZ -= 1.0f;
+        if (camHeight < 10.0f) camHeight = 10.0f;
+        if (camBackZ < 5.0f)  camBackZ = 5.0f;
+        break;
+
+    case 'R':
+        rackBalls();
+        break;
+
     default:
         break;
     }
-
-    //std::cout << toupper(key) << "\n";
-
-    /*switch (toupper(key))
-    {
-    case 'B':	createStack(PxTransform(PxVec3(0, 0, stackZ -= 10.0f)), 10, 2.0f);						break;
-    case ' ':	createDynamic(camera, PxSphereGeometry(3.0f), camera.rotate(PxVec3(0, 0, -1)) * 200);	break;
-    }*/
 }
 
+// -------------------- render --------------------
 void renderCallback()
 {
+    // фиксируем камеру (чтобы snippets controls не “увозили”)
+    PxVec3 eye(0.0f, camHeight, -camBackZ);
+    PxVec3 dir = (camTarget - eye).getNormalized();
+    camera->setPose(eye, dir);
+
     scene->simulate(1.0f / 60.0f);
     scene->fetchResults(true);
 
-    // если раньше не считали коллизии, а теперь включили, то заново считаем шейдеры
-    static bool lastNeedCollision = constantBlock.needCollision;
-    if (lastNeedCollision != constantBlock.needCollision) {
-        if (!lastNeedCollision) {
-            physx::PxU32 actorsNum = scene->getNbActors(physx::PxActorTypeFlag::eRIGID_STATIC | physx::PxActorTypeFlag::eRIGID_DYNAMIC);
-            if (actorsNum > 0) {
-                physx::PxArray<physx::PxRigidActor*> actorsArray(actorsNum);
-                scene->getActors(physx::PxActorTypeFlag::eRIGID_STATIC | physx::PxActorTypeFlag::eRIGID_DYNAMIC, (physx::PxActor**)&actorsArray[0], actorsNum);
-                for (int i = 0; i < actorsArray.size(); i++) {
-                    scene->resetFiltering(*actorsArray[i]);
-                }
-            }
-        }
-        lastNeedCollision = constantBlock.needCollision;
-    }
-
-    // удаляем объекты, которые соприкоснулись с триггером
-    for (int i = 0; i < removedActors.size(); i++) {
-        scene->removeActor(*removedActors[i]);
-    }
-    removedActors.clear();
+    processRemovals();
 
     Snippets::startRender(camera);
 
-    physx::PxScene* scene;
-    PxGetPhysics().getScenes(&scene, 1);
+    // рисуем актёров
+    PxU32 actorsNum = scene->getNbActors(PxActorTypeFlag::eRIGID_STATIC | PxActorTypeFlag::eRIGID_DYNAMIC);
+    if (actorsNum > 0)
+    {
+        PxArray<PxRigidActor*> actorsArray(actorsNum);
+        scene->getActors(PxActorTypeFlag::eRIGID_STATIC | PxActorTypeFlag::eRIGID_DYNAMIC,
+            (PxActor**)&actorsArray[0], actorsNum);
 
-    physx::PxU32 actorsNum = scene->getNbActors(physx::PxActorTypeFlag::eRIGID_STATIC | physx::PxActorTypeFlag::eRIGID_DYNAMIC);
-    if (actorsNum > 0) {
-        physx::PxArray<physx::PxRigidActor*> actorsArray(actorsNum);
-        scene->getActors(physx::PxActorTypeFlag::eRIGID_STATIC | physx::PxActorTypeFlag::eRIGID_DYNAMIC, (physx::PxActor**)&actorsArray[0], actorsNum);
-        Snippets::renderActors(&actorsArray[0], (actorsArray.size()), false);
+        Snippets::renderActors(&actorsArray[0], actorsArray.size(), false, physx::PxVec3(0.0f, 0.75f, 0.0f), NULL, true, false);
+    }
+
+    // линия прицела
+    if (!gameOver && cueBall && cueBall->actor)
+    {
+        PxVec3 p = cueBall->actor->getGlobalPose().p;
+        p.y += 0.05f;
+
+        PxVec3 q = p + aimDir() * aimLineLen;
+        Snippets::DrawLine(p, q, PxVec3(1.0f, 0.0f, 0.0f));
+    }
+
+    // HUD текст
+    {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+            "Aim(J/L): %.2f   Power(I/K): %.1f   %s",
+            aimAngle, shotImpulse, gameOver ? "GAME OVER (R to restart)" : "");
+        Snippets::print(buf);
     }
 
     Snippets::finishRender();
 }
 
-void exitCallback() {
+// -------------------- exit --------------------
+void exitCallback()
+{
     delete camera;
-    
-    scene->release();
-    physics->release();
-    foundation->release();
+    camera = nullptr;
+
+    if (scene)
+    {
+        clearBalls();
+        scene->release();
+        scene = nullptr;
+    }
+
+    if (dispatcher) { dispatcher->release(); dispatcher = nullptr; }
+
+    if (tableMaterial) { tableMaterial->release(); tableMaterial = nullptr; }
+    if (railMaterial) { railMaterial->release(); railMaterial = nullptr; }
+    if (ballMaterial) { ballMaterial->release(); ballMaterial = nullptr; }
+
+    if (physics) { physics->release(); physics = nullptr; }
+
+    if (transport) { transport->release(); transport = nullptr; }
+    if (pvd) { pvd->release(); pvd = nullptr; }
+    if (foundation) { foundation->release(); foundation = nullptr; }
 }
 
 int main()
 {
-    camera = new Snippets::Camera(physx::PxVec3(0.0f, 20.0f, 20.0f), physx::PxVec3(0.0f, -1.0f, -1.0f));
-    Snippets::setupDefault("PhysX test", camera, keyPress, renderCallback, exitCallback);
+    camera = new Snippets::Camera(PxVec3(0.0f, camHeight, -camBackZ), PxVec3(0.0f, -1.0f, 0.2f));
+
+    Snippets::setupDefault("PhysX Billiards - pockets + destroy",
+        camera, keyPress, renderCallback, exitCallback);
 
     initPhysics();
     glutMainLoop();
-    
     return 0;
 }
-
