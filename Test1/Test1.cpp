@@ -593,7 +593,7 @@ int main()
 {
     camera = new Snippets::Camera(PxVec3(0.0f, camHeight, -camBackZ), PxVec3(0.0f, -1.0f, 0.2f));
 
-    Snippets::setupDefault("PhysX Billiards - colored + visible pockets",
+    Snippets::setupDefault("PhysX Billiards",
         camera, keyPress, renderCallback, exitCallback);
 
     initPhysics();
