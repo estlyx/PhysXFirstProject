@@ -28,6 +28,14 @@ PxMaterial* tableMaterial = nullptr;
 PxMaterial* railMaterial = nullptr;
 PxMaterial* ballMaterial = nullptr;
 
+// Для раздельной отрисовки по цветам
+PxRigidStatic* groundPlaneActor = nullptr;  // "внешняя" бесконечная плоскость (вокруг стола)
+PxRigidStatic* tableTopActor = nullptr;  // прямоугольная столешница внутри бортов
+PxRigidStatic* railActors[4] = { nullptr, nullptr, nullptr, nullptr };
+
+// Лунки (триггеры), чтобы можно было их рисовать
+PxRigidStatic* pocketActors[6] = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
+
 // Очередь на удаление actor'ов (после fetchResults)
 PxArray<PxActor*> removedActors;
 
@@ -39,6 +47,9 @@ constexpr float kTableHalfZ = 14.0f;
 
 constexpr float kRailThick = 0.8f;
 constexpr float kRailH = 1.0f;
+
+// Толщина столешницы, чтобы зелёным был только прямоугольник, а не вся бесконечная плоскость
+constexpr float kTableTopHalfY = 0.10f; // половина толщины (верх будет на y=0)
 
 // ---- Лунки (trigger) ----
 // Лунки “в бортах”: центр на линии борта (по центру толщины борта),
@@ -73,8 +84,16 @@ float aimLineLen = 6.0f;
 
 // -------------------- Camera сверху --------------------
 float camHeight = 45.0f;
-float camBackZ = 0.01f;
+float camBackZ = 0.01f;               // маленький отъезд назад, чтобы dir не вырождался
 PxVec3 camTarget(0.0f, 0.0f, 0.0f);
+
+// -------------------- Цвета (рендер) --------------------
+static const PxVec3 COL_GROUND(0.25f, 0.25f, 0.25f); // серый вокруг стола
+static const PxVec3 COL_TABLE(0.05f, 0.55f, 0.12f); // зелёный стол
+static const PxVec3 COL_RAILS(0.35f, 0.18f, 0.06f); // коричневые борта
+static const PxVec3 COL_CUE(0.95f, 0.95f, 0.95f); // белый биток
+static const PxVec3 COL_OBJ(0.10f, 0.35f, 0.95f); // синие шары
+static const PxVec3 COL_POCKET(0.05f, 0.05f, 0.05f); // лунки тёмные
 
 // -------------------- Filter shader: триггеры + контакты --------------------
 PxFilterFlags CustomSimulationFilterShader(
@@ -102,7 +121,6 @@ public:
         for (PxU32 i = 0; i < count; i++)
         {
             const PxTriggerPair& pair = pairs[i];
-
             if (!(pair.status & PxPairFlag::eNOTIFY_TOUCH_FOUND))
                 continue;
 
@@ -112,10 +130,9 @@ public:
             Ball* b = reinterpret_cast<Ball*>(other->userData);
             if (!b) continue;
 
-            // не добавляем повторно
             if (b->pocketed) continue;
 
-            // нашли столкновение с лункой -> убираем со сцены через removedActors
+            // нашли попадание в лунку -> убираем со сцены через removedActors
             b->pocketed = true;
             removedActors.pushBack(other);
         }
@@ -131,12 +148,12 @@ public:
 CustomEventCallback customEventCallback;
 
 // -------------------- Create helpers --------------------
-static PxRigidStatic* createStaticPlane()
+static PxRigidStatic* createGroundPlane()
 {
     PxPlane plane(PxVec3(0, 1, 0), 0.0f);
-    PxRigidStatic* groundActor = PxCreatePlane(*physics, plane, *tableMaterial);
-    scene->addActor(*groundActor);
-    return groundActor;
+    groundPlaneActor = PxCreatePlane(*physics, plane, *tableMaterial);
+    scene->addActor(*groundPlaneActor);
+    return groundPlaneActor;
 }
 
 static PxRigidStatic* createStaticBox(const PxVec3& pos, const PxVec3& halfExt, PxMaterial& mat)
@@ -174,12 +191,8 @@ static PxRigidStatic* createPocketTriggerSphere(const PxVec3& pos)
     PxSphereGeometry geom(kPocketRadius);
     PxShape* shape = physics->createShape(geom, *railMaterial, true);
 
-    // trigger shape
     shape->setFlag(PxShapeFlag::eSIMULATION_SHAPE, false);
     shape->setFlag(PxShapeFlag::eTRIGGER_SHAPE, true);
-
-    // триггеры не рисуем, так лучше смотрятся
-    shape->setFlag(PxShapeFlag::eVISUALIZATION, false);
 
     PxRigidStatic* actor = physics->createRigidStatic(PxTransform(pos));
     actor->attachShape(*shape);
@@ -190,27 +203,34 @@ static PxRigidStatic* createPocketTriggerSphere(const PxVec3& pos)
 // -------------------- Table + rails --------------------
 static void createTableAndRails()
 {
-    createStaticPlane();
+    // 1) бесконечная плоскость (вокруг стола)
+    createGroundPlane();
 
-    // Левый/правый борта вдоль Z
-    createStaticBox(
+    // 2) прямоугольная "столешница" внутри бортов
+    tableTopActor = createStaticBox(
+        PxVec3(0.0f, -kTableTopHalfY, 0.0f),
+        PxVec3(kTableHalfX, kTableTopHalfY, kTableHalfZ),
+        *tableMaterial
+    );
+
+    // 3) борта
+    railActors[0] = createStaticBox(
         PxVec3(+(kTableHalfX + kRailThick * 0.5f), kRailH * 0.5f, 0.0f),
         PxVec3(kRailThick * 0.5f, kRailH * 0.5f, kTableHalfZ + kRailThick),
         *railMaterial
     );
-    createStaticBox(
+    railActors[1] = createStaticBox(
         PxVec3(-(kTableHalfX + kRailThick * 0.5f), kRailH * 0.5f, 0.0f),
         PxVec3(kRailThick * 0.5f, kRailH * 0.5f, kTableHalfZ + kRailThick),
         *railMaterial
     );
 
-    // Верх/низ вдоль X
-    createStaticBox(
+    railActors[2] = createStaticBox(
         PxVec3(0.0f, kRailH * 0.5f, +(kTableHalfZ + kRailThick * 0.5f)),
         PxVec3(kTableHalfX + kRailThick, kRailH * 0.5f, kRailThick * 0.5f),
         *railMaterial
     );
-    createStaticBox(
+    railActors[3] = createStaticBox(
         PxVec3(0.0f, kRailH * 0.5f, -(kTableHalfZ + kRailThick * 0.5f)),
         PxVec3(kTableHalfX + kRailThick, kRailH * 0.5f, kRailThick * 0.5f),
         *railMaterial
@@ -221,15 +241,15 @@ static void createPockets()
 {
     const float y = kBallR;
 
-    // 4 угла — в районе углов бортов
-    createPocketTriggerSphere(PxVec3(+kPocketX, y, +kPocketZ));
-    createPocketTriggerSphere(PxVec3(-kPocketX, y, +kPocketZ));
-    createPocketTriggerSphere(PxVec3(+kPocketX, y, -kPocketZ));
-    createPocketTriggerSphere(PxVec3(-kPocketX, y, -kPocketZ));
+    // 4 угла
+    pocketActors[0] = createPocketTriggerSphere(PxVec3(+kPocketX, y, +kPocketZ));
+    pocketActors[1] = createPocketTriggerSphere(PxVec3(-kPocketX, y, +kPocketZ));
+    pocketActors[2] = createPocketTriggerSphere(PxVec3(+kPocketX, y, -kPocketZ));
+    pocketActors[3] = createPocketTriggerSphere(PxVec3(-kPocketX, y, -kPocketZ));
 
-    // центры длинных бортов (длинные вдоль Z, значит центры на x=±)
-    createPocketTriggerSphere(PxVec3(+kPocketX + 0.25, y, 0.0f));
-    createPocketTriggerSphere(PxVec3(-kPocketX - 0.25, y, 0.0f));
+    // центры длинных бортов
+    pocketActors[4] = createPocketTriggerSphere(PxVec3(+kPocketX + 0.25f, y, 0.0f));
+    pocketActors[5] = createPocketTriggerSphere(PxVec3(-kPocketX - 0.25f, y, 0.0f));
 }
 
 // -------------------- Расставляем шары --------------------
@@ -297,7 +317,7 @@ static void rackBalls()
     std::cout << "Controls: J/L aim, I/K power, Space shoot, R restart\n";
 }
 
-// -------------------- Нарпавление удара --------------------
+// -------------------- Направление удара --------------------
 static PxVec3 aimDir()
 {
     const float sx = PxSin(aimAngle);
@@ -396,7 +416,7 @@ void initPhysics()
 
     scene = physics->createScene(sceneDesc);
 
-    // материалы
+    // материалы (физика)
     tableMaterial = physics->createMaterial(0.5f, 0.5f, 0.05f);
     railMaterial = physics->createMaterial(0.6f, 0.6f, 0.2f);
     ballMaterial = physics->createMaterial(0.15f, 0.15f, 0.05f);
@@ -439,7 +459,7 @@ void keyPress(unsigned char key, const PxTransform&)
         camHeight -= 2.0f;
         camBackZ -= 1.0f;
         if (camHeight < 10.0f) camHeight = 10.0f;
-        if (camBackZ < 5.0f)  camBackZ = 5.0f;
+        if (camBackZ < 0.01f)  camBackZ = 0.01f;
         break;
 
     case 'R':
@@ -466,15 +486,59 @@ void renderCallback()
 
     Snippets::startRender(camera);
 
-    // рисуем actors
-    PxU32 actorsNum = scene->getNbActors(PxActorTypeFlag::eRIGID_STATIC | PxActorTypeFlag::eRIGID_DYNAMIC);
-    if (actorsNum > 0)
+    // Рисуем по группам, чтобы задать разные цвета
+    // changeColorForSleepingActors = false, wireframePass = false
     {
-        PxArray<PxRigidActor*> actorsArray(actorsNum);
-        scene->getActors(PxActorTypeFlag::eRIGID_STATIC | PxActorTypeFlag::eRIGID_DYNAMIC,
-            (PxActor**)&actorsArray[0], actorsNum);
+        // 1) "внешняя" плоскость вокруг стола (серая)
+        if (groundPlaneActor)
+        {
+            PxRigidActor* a = groundPlaneActor;
+            Snippets::renderActors(&a, 1, false, COL_GROUND, NULL, false, false);
+        }
 
-        Snippets::renderActors(&actorsArray[0], actorsArray.size(), false, physx::PxVec3(0.0f, 0.75f, 0.0f), NULL, false, false);
+        // 2) зелёная столешница (прямоугольник)
+        if (tableTopActor)
+        {
+            PxRigidActor* a = tableTopActor;
+            Snippets::renderActors(&a, 1, false, COL_TABLE, NULL, false, false);
+        }
+
+        // 3) борта (коричневые)
+        PxRigidActor* railsToDraw[4];
+        PxU32 nRails = 0;
+        for (int i = 0; i < 4; i++)
+            if (railActors[i]) railsToDraw[nRails++] = railActors[i];
+
+        if (nRails)
+            Snippets::renderActors(railsToDraw, nRails, false, COL_RAILS, NULL, false, false);
+
+        // 4) лунки (триггеры)
+        PxRigidActor* pocketsToDraw[6];
+        PxU32 nPockets = 0;
+        for (int i = 0; i < 6; i++)
+            if (pocketActors[i]) pocketsToDraw[nPockets++] = pocketActors[i];
+
+        if (nPockets)
+            Snippets::renderActors(pocketsToDraw, nPockets, false, COL_POCKET, NULL, false, false);
+
+        // 5) шары: объектные (синие) + биток (белый)
+        PxRigidActor* objBalls[16];
+        PxU32 nObj = 0;
+
+        PxRigidActor* cue[1];
+        PxU32 nCue = 0;
+
+        for (const auto& b : balls)
+        {
+            if (!b.actor) continue;
+            if (b.isCue) cue[nCue++] = b.actor;
+            else         objBalls[nObj++] = b.actor;
+        }
+
+        if (nObj)
+            Snippets::renderActors(objBalls, nObj, false, COL_OBJ, NULL, false, false);
+        if (nCue)
+            Snippets::renderActors(cue, nCue, false, COL_CUE, NULL, false, false);
     }
 
     // линия прицела
@@ -489,10 +553,10 @@ void renderCallback()
 
     // HUD текст
     {
-        char buf[160];
+        char buf[220];
         std::snprintf(buf, sizeof(buf),
             "Aim(J/L): %.2f   Power(I/K): %.1f   %s",
-            aimAngle, shotImpulse, gameOver ? "GAME OVER (R to restart)" : "");
+            aimAngle, shotImpulse, gameOver ? (winGame ? "WIN (R to restart)" : "LOSE (R to restart)") : "");
         Snippets::print(buf);
     }
 
@@ -529,7 +593,7 @@ int main()
 {
     camera = new Snippets::Camera(PxVec3(0.0f, camHeight, -camBackZ), PxVec3(0.0f, -1.0f, 0.2f));
 
-    Snippets::setupDefault("PhysX Billiards - pockets + destroy",
+    Snippets::setupDefault("PhysX Billiards - colored + visible pockets",
         camera, keyPress, renderCallback, exitCallback);
 
     initPhysics();
