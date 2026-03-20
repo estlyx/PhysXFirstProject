@@ -10,7 +10,7 @@
 
 using namespace physx;
 
-// -------------------- Globals (как в твоём примере) --------------------
+// -------------------- Globals --------------------
 Snippets::Camera* camera = nullptr;
 
 PxDefaultAllocator allocator;
@@ -28,10 +28,10 @@ PxMaterial* tableMaterial = nullptr;
 PxMaterial* railMaterial = nullptr;
 PxMaterial* ballMaterial = nullptr;
 
-// Очередь на удаление актёров (после fetchResults)
+// Очередь на удаление actor'ов (после fetchResults)
 PxArray<PxActor*> removedActors;
 
-// -------------------- Размеры (в "твоих" единицах) --------------------
+// -------------------- Размеры  --------------------
 constexpr float kBallR = 0.25f;
 
 constexpr float kTableHalfX = 8.0f;
@@ -71,7 +71,7 @@ float aimAngle = 0.0f;        // 0 => +Z (к пирамиде)
 float shotImpulse = 30.0f;
 float aimLineLen = 6.0f;
 
-// -------------------- Camera сверху (фиксируем каждый кадр) --------------------
+// -------------------- Camera сверху --------------------
 float camHeight = 45.0f;
 float camBackZ = 0.01f;
 PxVec3 camTarget(0.0f, 0.0f, 0.0f);
@@ -93,7 +93,7 @@ PxFilterFlags CustomSimulationFilterShader(
     return PxFilterFlag::eDEFAULT;
 }
 
-// -------------------- Trigger callback (как у тебя) --------------------
+// -------------------- Trigger callback --------------------
 class CustomEventCallback : public PxSimulationEventCallback
 {
 public:
@@ -115,11 +115,9 @@ public:
             // не добавляем повторно
             if (b->pocketed) continue;
 
+            // нашли столкновение с лункой -> убираем со сцены через removedActors
             b->pocketed = true;
             removedActors.pushBack(other);
-
-            // можно отладить:
-            // std::cout << "POCKET ball id=" << b->id << (b->isCue ? " (CUE)\n" : "\n");
         }
     }
 
@@ -132,7 +130,7 @@ public:
 
 CustomEventCallback customEventCallback;
 
-// -------------------- Create helpers (как у тебя: createShape + attachShape) --------------------
+// -------------------- Create helpers --------------------
 static PxRigidStatic* createStaticPlane()
 {
     PxPlane plane(PxVec3(0, 1, 0), 0.0f);
@@ -180,7 +178,7 @@ static PxRigidStatic* createPocketTriggerSphere(const PxVec3& pos)
     shape->setFlag(PxShapeFlag::eSIMULATION_SHAPE, false);
     shape->setFlag(PxShapeFlag::eTRIGGER_SHAPE, true);
 
-    // чтобы не было “странных шаров/текстур” — триггеры не рисуем
+    // триггеры не рисуем, так лучше смотрятся
     shape->setFlag(PxShapeFlag::eVISUALIZATION, false);
 
     PxRigidStatic* actor = physics->createRigidStatic(PxTransform(pos));
@@ -234,7 +232,7 @@ static void createPockets()
     createPocketTriggerSphere(PxVec3(-kPocketX - 0.25, y, 0.0f));
 }
 
-// -------------------- Rack balls --------------------
+// -------------------- Расставляем шары --------------------
 static void clearBalls()
 {
     for (auto& b : balls)
@@ -299,7 +297,7 @@ static void rackBalls()
     std::cout << "Controls: J/L aim, I/K power, Space shoot, R restart\n";
 }
 
-// -------------------- Aim direction --------------------
+// -------------------- Нарпавление удара --------------------
 static PxVec3 aimDir()
 {
     const float sx = PxSin(aimAngle);
@@ -309,7 +307,7 @@ static PxVec3 aimDir()
     return d;
 }
 
-// -------------------- shoot --------------------
+// -------------------- Удар --------------------
 static void shoot()
 {
     if (gameOver) return;
@@ -456,7 +454,7 @@ void keyPress(unsigned char key, const PxTransform&)
 // -------------------- render --------------------
 void renderCallback()
 {
-    // фиксируем камеру (чтобы snippets controls не “увозили”)
+    // фиксируем камеру
     PxVec3 eye(0.0f, camHeight, -camBackZ);
     PxVec3 dir = (camTarget - eye).getNormalized();
     camera->setPose(eye, dir);
@@ -468,7 +466,7 @@ void renderCallback()
 
     Snippets::startRender(camera);
 
-    // рисуем актёров
+    // рисуем actors
     PxU32 actorsNum = scene->getNbActors(PxActorTypeFlag::eRIGID_STATIC | PxActorTypeFlag::eRIGID_DYNAMIC);
     if (actorsNum > 0)
     {
@@ -476,7 +474,7 @@ void renderCallback()
         scene->getActors(PxActorTypeFlag::eRIGID_STATIC | PxActorTypeFlag::eRIGID_DYNAMIC,
             (PxActor**)&actorsArray[0], actorsNum);
 
-        Snippets::renderActors(&actorsArray[0], actorsArray.size(), false, physx::PxVec3(0.0f, 0.75f, 0.0f), NULL, true, false);
+        Snippets::renderActors(&actorsArray[0], actorsArray.size(), false, physx::PxVec3(0.0f, 0.75f, 0.0f), NULL, false, false);
     }
 
     // линия прицела
