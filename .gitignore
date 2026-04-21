@@ -361,3 +361,9 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+!Test1/lib/bin/
+!Test1/lib/bin/Debug/
+!Test1/lib/bin/Debug/**
+!Test1/lib/bin/Release/
+!Test1/lib/bin/Release/**
